@@ -1,0 +1,87 @@
+"""
+Trend-based drift detection
+===========================
+Why this module exists
+----------------------
+engineer.py runs CUSUM on the STL *residual*. STL is designed to absorb slow
+movements into its trend component, so a gradual latency drift ends up in
+``stl_trend`` and the residual keeps a mean near zero. On the simulated
+``raw_sessions`` drift (+2.5 min/day from day 60) the trend rises from about
+60 to about 347 minutes while the residual mean stays near zero, and the
+residual-CUSUM only alerts on days 143-146.
+
+This module watches the trend itself. A table is flagged when the trend sits
+more than ``z_threshold`` reference-residual standard deviations above its
+reference level for ``min_run`` consecutive days.
+
+Limits
+------
+* STL's trend is a centred smoother, so this is an offline audit rule. It uses
+  observations on both sides of each day and is not a causal real-time alert.
+* ``z_threshold`` was chosen with a margin above the largest trend excursion
+  seen on non-drifting tables in the simulation. Re-check it on real data.
+"""
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+
+
+def trend_drift_alert(
+    trend,
+    residual,
+    ref_len: int = 45,
+    z_threshold: float = 5.0,
+    min_run: int = 3,
+) -> dict:
+    """Return drift status for one table's STL trend and residual."""
+    trend = np.asarray(trend, dtype=float)
+    residual = np.asarray(residual, dtype=float)
+    if len(trend) != len(residual):
+        raise ValueError("trend and residual must have the same length")
+    if len(trend) < ref_len + min_run:
+        raise ValueError("series is shorter than the reference window plus min_run")
+
+    sd = float(np.std(residual[:ref_len], ddof=1))
+    sd = sd if sd > 0 else 1e-9
+    z = (trend - trend[:ref_len].mean()) / sd
+
+    above = (z > z_threshold).astype(int)
+    run_hits = np.convolve(above, np.ones(min_run, dtype=int), mode="valid") >= min_run
+    hits = np.flatnonzero(run_hits)
+
+    return {
+        "drift_detected": bool(len(hits)),
+        "first_alert_index": int(hits.min()) if len(hits) else None,
+        "peak_trend_z": float(z.max()),
+    }
+
+
+def detect_trend_drift(
+    features: pd.DataFrame,
+    ref_len: int = 45,
+    z_threshold: float = 5.0,
+    min_run: int = 3,
+) -> pd.DataFrame:
+    """Apply ``trend_drift_alert`` to every table in the feature matrix."""
+    needed = {"table_name", "day_idx", "stl_trend", "stl_residual"}
+    missing = needed - set(features.columns)
+    if missing:
+        raise KeyError(f"feature matrix is missing columns: {sorted(missing)}")
+
+    rows = []
+    for table, grp in features.groupby("table_name"):
+        grp = grp.sort_values("day_idx").reset_index(drop=True)
+        res = trend_drift_alert(
+            grp["stl_trend"], grp["stl_residual"], ref_len, z_threshold, min_run
+        )
+        first = res["first_alert_index"]
+        rows.append(
+            {
+                "table_name": table,
+                "drift_detected": res["drift_detected"],
+                "first_alert_day": int(grp.loc[first, "day_idx"]) if first is not None else None,
+                "peak_trend_z": round(res["peak_trend_z"], 2),
+            }
+        )
+    return pd.DataFrame(rows).sort_values("peak_trend_z", ascending=False).reset_index(drop=True)
