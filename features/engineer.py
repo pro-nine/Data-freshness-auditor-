@@ -1,388 +1,289 @@
 """
-FreshnessFeatureEngineer
-========================
-Transforms raw pipeline run records into a rich feature matrix.
+FreshnessFeatureEngineer (v2: causal features, ground-truth labels)
+===================================================================
+Feature families
+F1  Temporal baseline   per-table, per-weekday rolling history (shifted, causal)
+F2  Causal baseline     weekday offsets and robust level/scale from a fixed
+                        reference window (first `ref_days` days), no future data
+F3  Drift detectors     EWMA control chart + clipped CUSUM on the deseasonalised
+                        latency z-score
+F4  3-bit state machine execution x rows_read x rows_written
+F5  DAG features        centrality, blast radius, depth, criticality
+F6  Rolling statistics  entropy, IQR, kurtosis, velocity
+F7  Row anomalies       rolling z-score and drop ratio
+F8  Upstream context    failed or alerting ancestors on the same day
 
-Feature families:
-  F1 — Temporal baseline features (learned per-table arrival distribution)
-  F2 — STL decomposition features (trend + seasonality + residual on latency)
-  F3 — CUSUM control chart signals (S+, S-, alert flag, drift score)
-  F4 — 3-bit diagnostic state machine (execution x rows_read x rows_written)
-  F5 — DAG-derived graph features (centrality, blast radius, depth, ancestry load)
-  F6 — Rolling window statistics (not just mean/std — entropy, IQR, kurtosis)
-  F7 — Row count anomaly signals (Z-score + deviation from historical quantile)
+What changed from v1, and why
+-----------------------------
+* v1 ran STL over the whole series and calibrated CUSUM on the first 60% of the
+  full series, so both used future data. STL also moved a gradual drift into
+  its trend, leaving the residual-CUSUM blind to it. v2 detectors are causal.
+* v1 built `severity_label` as a threshold rule over the model's own inputs. v2
+  takes `severity_label` from the injected events (features/labels.py) and keeps
+  the old rule as `rule_severity`, a baseline detector to beat.
+* STL is still available through ``include_stl_audit=True`` for offline audits.
 
-Why STL before CUSUM (the critical design decision):
-  CUSUM operates on the assumption that the baseline process mean μ₀ is stable.
-  Raw latency violates this — it has weekly seasonality (weekends are faster),
-  hourly patterns, and long-term trend. If you run CUSUM on raw latency,
-  Monday's natural high will look like a drift signal on Sunday's baseline.
-  Solution: STL decomposes latency → trend + seasonal + residual.
-  CUSUM runs on the RESIDUAL only — pure unexplained deviation.
+Assumption: the first `ref_days` days of each table are healthy (a Phase-I
+reference window). Cascades in the simulation start on day 30, after day 28.
 """
+import os
+import sys
+import warnings
 
+import networkx as nx
 import numpy as np
 import pandas as pd
-import networkx as nx
-from statsmodels.tsa.seasonal import STL
 from scipy import stats
-import warnings
+from statsmodels.tsa.seasonal import STL
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from features.labels import ground_truth_family, ground_truth_severity  # noqa: E402
+
 warnings.filterwarnings("ignore")
 
 
-# ─────────────────────────────────────────────────────────────
-# CUSUM ENGINE — per-table stateful control chart
-# ─────────────────────────────────────────────────────────────
-class CUSUMEngine:
-    """
-    One-sided upper CUSUM for detecting positive latency drift.
-    Two-sided variant also computed for anomalous speed-up detection.
+class CausalBaseline:
+    """Weekday offsets plus robust level/scale from a reference window."""
 
-    Parameters
-    ----------
-    k : float
-        Allowance parameter. Typically k = 0.5σ (half the shift to detect).
-        We auto-calibrate k from the table's historical residual std.
-    h : float
-        Decision interval (control limit). Alert when S+ > h.
-        h = 4σ catches shifts > 1σ with ARL ≈ 168 observations.
-    """
+    def __init__(self, ref_days: int = 28):
+        self.ref_days = ref_days
 
-    def __init__(self, k_factor: float = 0.5, h_factor: float = 4.0):
-        self.k_factor = k_factor
-        self.h_factor = h_factor
+    def transform(self, latency: pd.Series, dow: pd.Series) -> pd.DataFrame:
+        lat = latency.astype(float).ffill().fillna(0).values
+        dw = dow.values
+        r = self.ref_days
+        profile = pd.Series(lat[:r]).groupby(dw[:r]).mean()
+        offset = np.array([profile.get(d, profile.mean()) for d in dw]) - profile.mean()
+        ds = lat - offset
+        mu = float(np.median(ds[:r]))
+        sd = max(1.4826 * float(np.median(np.abs(ds[:r] - mu))), 1e-6)
+        return pd.DataFrame({"lat_ds": ds, "ds_z": (ds - mu) / sd, "ref_mu": mu, "ref_sd": sd},
+                            index=latency.index)
 
-    def fit_transform(self, residuals: pd.Series) -> pd.DataFrame:
-        """
-        residuals : STL residual of latency time series (mean ~0)
-        Returns DataFrame with S+, S-, alert flags, drift score.
-        """
-        # Auto-calibrate from in-sample variance (first 60% of data)
-        train_len  = max(10, int(len(residuals) * 0.6))
-        sigma      = residuals.iloc[:train_len].std()
-        mu0        = residuals.iloc[:train_len].mean()
 
-        k = self.k_factor * sigma   # allowance
-        h = self.h_factor * sigma   # control limit
+class DriftDetectors:
+    """EWMA chart (level shifts, drift) and clipped CUSUM (small persistent shifts)."""
 
-        S_pos  = np.zeros(len(residuals))
-        S_neg  = np.zeros(len(residuals))
-        x      = residuals.values
+    def __init__(self, ewma_span=10, ewma_limit=3.0, ewma_run=3, cusum_k=1.0, cusum_h=5.0, clip=3.0):
+        self.span, self.limit, self.run = ewma_span, ewma_limit, ewma_run
+        self.k, self.h, self.clip = cusum_k, cusum_h, clip
 
-        for t in range(1, len(x)):
-            S_pos[t] = max(0, S_pos[t-1] + (x[t] - mu0 - k))
-            S_neg[t] = max(0, S_neg[t-1] - (x[t] - mu0 - k))
-
-        alert_up   = (S_pos > h).astype(int)
-        alert_down = (S_neg > h).astype(int)
-
-        # Drift score: normalised cumulative signal relative to control limit
-        drift_score = np.clip(S_pos / (h + 1e-9), 0, 5.0)
-
+    def transform(self, base: pd.DataFrame) -> pd.DataFrame:
+        z = base["ds_z"].values
+        ewma = pd.Series(np.clip(z, -4.0, 4.0)).ewm(span=self.span, adjust=False).mean().values
+        over = (ewma > self.limit).astype(int)
+        run = np.zeros(len(z), dtype=int)
+        for t in range(len(z)):
+            run[t] = run[t - 1] + 1 if (t and over[t]) else int(over[t])
+        zc = np.clip(z, -self.clip, self.clip)
+        s_pos, s_neg = np.zeros(len(z)), np.zeros(len(z))
+        for t in range(1, len(z)):
+            s_pos[t] = max(0.0, s_pos[t - 1] + zc[t] - self.k)
+            s_neg[t] = max(0.0, s_neg[t - 1] - zc[t] - self.k)
         return pd.DataFrame({
-            "cusum_s_pos":    S_pos,
-            "cusum_s_neg":    S_neg,
-            "cusum_alert_up": alert_up,
-            "cusum_alert_dn": alert_down,
-            "cusum_drift_score": drift_score,
-            "cusum_k":        k,
-            "cusum_h":        h,
-            "cusum_sigma":    sigma,
-        }, index=residuals.index)
+            "ewma_z": ewma,
+            "ewma_run": run,
+            "ewma_alert": (run >= self.run).astype(int),
+            "cusum_s_pos": s_pos,
+            "cusum_s_neg": s_neg,
+            "cusum_alert_up": (s_pos > self.h).astype(int),
+            "cusum_alert_dn": (s_neg > self.h).astype(int),
+            "cusum_drift_score": np.clip(s_pos / self.h, 0, 5.0),
+        }, index=base.index)
 
 
-# ─────────────────────────────────────────────────────────────
-# 3-BIT DIAGNOSTIC STATE MACHINE
-# ─────────────────────────────────────────────────────────────
 DIAGNOSTIC_STATE_MAP = {
-    # (exec_ok, rows_read_ok, rows_written_ok) → (state_code, label, owner)
-    (1, 1, 1): (0, "HEALTHY",                 "none"),
+    (1, 1, 1): (0, "HEALTHY", "none"),
     (1, 1, 0): (1, "SILENT_BUSINESS_FAILURE", "analytics_engineer"),
-    (1, 0, 0): (2, "EXPECTED_EMPTY",          "monitor_only"),
-    (1, 0, 1): (3, "IMPOSSIBLE_STATE",        "data_quality"),
-    (0, 0, 0): (4, "INFRASTRUCTURE_FAILURE",  "platform_team"),
-    (0, 1, 1): (5, "EXEC_FAILED_DATA_OK",     "orchestration_team"),
-    (0, 1, 0): (6, "PARTIAL_FAILURE",         "platform_team"),
-    (0, 0, 1): (7, "IMPOSSIBLE_STATE",        "data_quality"),
+    (1, 0, 0): (2, "EXPECTED_EMPTY", "monitor_only"),
+    (1, 0, 1): (3, "IMPOSSIBLE_STATE", "data_quality"),
+    (0, 0, 0): (4, "INFRASTRUCTURE_FAILURE", "platform_team"),
+    (0, 1, 1): (5, "EXEC_FAILED_DATA_OK", "orchestration_team"),
+    (0, 1, 0): (6, "PARTIAL_FAILURE", "platform_team"),
+    (0, 0, 1): (7, "IMPOSSIBLE_STATE", "data_quality"),
 }
 
-def compute_diagnostic_state(row: pd.Series,
-                               rows_read_floor: int = 10,
-                               rows_written_floor: int = 10) -> tuple:
-    exec_ok        = int(row["execution_status"] in ["SUCCESS", "RETRIED"])
-    rows_read_ok   = int(row["rows_read"] >= rows_read_floor)
-    rows_written_ok= int(row["rows_written"] >= rows_written_floor)
-    key = (exec_ok, rows_read_ok, rows_written_ok)
-    state_code, label, owner = DIAGNOSTIC_STATE_MAP.get(key, (8, "UNKNOWN", "unknown"))
-    return state_code, label, owner, exec_ok, rows_read_ok, rows_written_ok
+
+def compute_diagnostic_state(row, rows_read_floor: int = 10, rows_written_floor: int = 10) -> tuple:
+    exec_ok = int(row["execution_status"] in ["SUCCESS", "RETRIED"])
+    read_ok = int(row["rows_read"] >= rows_read_floor)
+    write_ok = int(row["rows_written"] >= rows_written_floor)
+    code, label, owner = DIAGNOSTIC_STATE_MAP.get((exec_ok, read_ok, write_ok), (8, "UNKNOWN", "unknown"))
+    return code, label, owner, exec_ok, read_ok, write_ok
 
 
-# ─────────────────────────────────────────────────────────────
-# DAG FEATURE EXTRACTOR
-# ─────────────────────────────────────────────────────────────
 class DAGFeatureExtractor:
+    CRIT = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
 
     def __init__(self, dag: nx.DiGraph):
         self.dag = dag
-        self._precompute()
-
-    def _precompute(self):
-        G = self.dag
-        # Betweenness centrality: high-centrality nodes are single points of failure
-        self.centrality     = nx.betweenness_centrality(G)
-        # In-degree: number of dependencies (more deps = more failure exposure)
-        self.in_degree      = dict(G.in_degree())
-        # Out-degree: blast radius at immediate next level
-        self.out_degree     = dict(G.out_degree())
-        # Topological depth (level in DAG)
-        self.depth          = {n: 0 for n in G.nodes}
+        G = dag
+        self.centrality = nx.betweenness_centrality(G)
+        self.in_degree = dict(G.in_degree())
+        self.out_degree = dict(G.out_degree())
+        self.depth = {n: 0 for n in G.nodes}
         for n in nx.topological_sort(G):
-            for successor in G.successors(n):
-                self.depth[successor] = max(
-                    self.depth[successor], self.depth[n] + 1)
-        # Total downstream impact: all nodes reachable from this one
-        self.blast_radius   = {
-            n: len(nx.descendants(G, n)) for n in G.nodes
-        }
-        # Total upstream ancestry: how many tables must succeed before this one
-        self.ancestry_count = {
-            n: len(nx.ancestors(G, n)) for n in G.nodes
-        }
-        # Criticality score: map categorical to numeric
-        crit_map = {"LOW": 1, "MEDIUM": 2, "HIGH": 3, "CRITICAL": 4}
-        from data.simulator import DAG_SCHEMA
-        self.crit_numeric   = {
-            n: crit_map.get(DAG_SCHEMA[n]["criticality"], 1)
-            for n in G.nodes
-        }
+            for s in G.successors(n):
+                self.depth[s] = max(self.depth[s], self.depth[n] + 1)
+        self.blast_radius = {n: len(nx.descendants(G, n)) for n in G.nodes}
+        self.ancestors = {n: nx.ancestors(G, n) for n in G.nodes}
+        self.ancestry_count = {n: len(a) for n, a in self.ancestors.items()}
+        self.crit_numeric = {n: self.CRIT.get(G.nodes[n].get("criticality"), 1) for n in G.nodes}
 
     def get_features(self, table: str) -> dict:
         return {
-            "dag_centrality":     round(self.centrality.get(table, 0), 6),
-            "dag_in_degree":      self.in_degree.get(table, 0),
-            "dag_out_degree":     self.out_degree.get(table, 0),
-            "dag_depth":          self.depth.get(table, 0),
-            "dag_blast_radius":   self.blast_radius.get(table, 0),
+            "dag_centrality": round(self.centrality.get(table, 0), 6),
+            "dag_in_degree": self.in_degree.get(table, 0),
+            "dag_out_degree": self.out_degree.get(table, 0),
+            "dag_depth": self.depth.get(table, 0),
+            "dag_blast_radius": self.blast_radius.get(table, 0),
             "dag_ancestry_count": self.ancestry_count.get(table, 0),
-            "dag_criticality":    self.crit_numeric.get(table, 1),
+            "dag_criticality": self.crit_numeric.get(table, 1),
         }
 
 
-# ─────────────────────────────────────────────────────────────
-# MAIN FEATURE ENGINEER
-# ─────────────────────────────────────────────────────────────
 class FreshnessFeatureEngineer:
+    def __init__(self, df: pd.DataFrame, dag: nx.DiGraph, ref_days: int = 28,
+                 include_stl_audit: bool = False):
+        self.df = df.copy().sort_values(["table_name", "day_idx"])
+        self.dag = dag
+        self.dag_extractor = DAGFeatureExtractor(dag)
+        self.baseline = CausalBaseline(ref_days)
+        self.detectors = DriftDetectors()
+        self.include_stl_audit = include_stl_audit
 
-    def __init__(self, df: pd.DataFrame, dag: nx.DiGraph):
-        self.df           = df.copy().sort_values(["table_name", "day_idx"])
-        self.dag          = dag
-        self.dag_extractor= DAGFeatureExtractor(dag)
-        self.cusum_engine = CUSUMEngine(k_factor=0.5, h_factor=4.0)
-
-    # ── F1: Temporal baseline features ──────────────────────
-    def _f1_temporal(self, grp: pd.DataFrame) -> pd.DataFrame:
-        # Rolling 21-day (3-week) historical stats per day-of-week
-        # Critical: group by day-of-week before rolling to avoid
-        # mixing Mon baseline with Sun baseline
+    def _f1_temporal(self, grp):
         grp = grp.copy()
-        grp["hist_mean_21d"] = (
-            grp.groupby("day_of_week")["latency_minutes"]
-               .transform(lambda x: x.shift(1).rolling(21, min_periods=5).mean())
-        )
-        grp["hist_std_21d"] = (
-            grp.groupby("day_of_week")["latency_minutes"]
-               .transform(lambda x: x.shift(1).rolling(21, min_periods=5).std())
-        )
-        grp["hist_p90_21d"] = (
-            grp.groupby("day_of_week")["latency_minutes"]
-               .transform(lambda x: x.shift(1).rolling(21, min_periods=5)
-                          .quantile(0.90))
-        )
-        # Z-score of current latency vs historical distribution
-        grp["latency_zscore"] = (
-            (grp["latency_minutes"] - grp["hist_mean_21d"])
-            / (grp["hist_std_21d"].replace(0, 1e-9))
-        )
-        # Percentile rank within window (non-parametric)
-        grp["latency_pct_rank"] = (
-            grp.groupby("day_of_week")["latency_minutes"]
-               .transform(lambda x: x.shift(1).rolling(21, min_periods=5)
-                          .apply(lambda w: stats.percentileofscore(w, w[-1])
-                                 / 100 if len(w) > 0 else 0.5, raw=True))
-        )
+        by = grp.groupby("day_of_week")["latency_minutes"]
+        roll = lambda x: x.shift(1).rolling(21, min_periods=5)
+        grp["hist_mean_21d"] = by.transform(lambda x: roll(x).mean())
+        grp["hist_std_21d"] = by.transform(lambda x: roll(x).std())
+        grp["hist_p90_21d"] = by.transform(lambda x: roll(x).quantile(0.90))
+        grp["latency_zscore"] = (grp["latency_minutes"] - grp["hist_mean_21d"]) / grp["hist_std_21d"].replace(0, 1e-9)
+        grp["latency_pct_rank"] = by.transform(
+            lambda x: roll(x).apply(lambda w: stats.percentileofscore(w, w[-1]) / 100 if len(w) else 0.5, raw=True))
         return grp
 
-    # ── F2: STL decomposition + residual extraction ─────────
-    def _f2_stl(self, grp: pd.DataFrame) -> pd.DataFrame:
+    def _f2_f3_causal(self, grp):
+        grp = grp.copy().reset_index(drop=True)
+        base = self.baseline.transform(grp["latency_minutes"], grp["day_of_week"])
+        return pd.concat([grp, base, self.detectors.transform(base)], axis=1)
+
+    def _stl_audit(self, grp):
         grp = grp.copy().reset_index(drop=True)
         lat = grp["latency_minutes"].ffill().fillna(0)
-
-        # STL requires at least 2 full periods
-        # Period = 7 (weekly seasonality in daily data)
-        if len(lat) < 14:
-            grp["stl_trend"]    = lat
-            grp["stl_seasonal"] = 0.0
-            grp["stl_residual"] = 0.0
-            return grp
-
         try:
-            stl    = STL(lat, period=7, robust=True)
-            result = stl.fit()
-            grp["stl_trend"]    = result.trend
-            grp["stl_seasonal"] = result.seasonal
-            grp["stl_residual"] = result.resid   # ← CUSUM will run on this
+            res = STL(lat, period=7, robust=True).fit()
+            grp["stl_trend"], grp["stl_seasonal"], grp["stl_residual"] = res.trend, res.seasonal, res.resid
         except Exception:
-            grp["stl_trend"]    = lat
-            grp["stl_seasonal"] = 0.0
-            grp["stl_residual"] = lat - lat.mean()
-
+            grp["stl_trend"], grp["stl_seasonal"], grp["stl_residual"] = lat, 0.0, lat - lat.mean()
         return grp
 
-    # ── F3: CUSUM signals on STL residual ───────────────────
-    def _f3_cusum(self, grp: pd.DataFrame) -> pd.DataFrame:
-        grp = grp.copy().reset_index(drop=True)
-        residual = grp["stl_residual"].fillna(0)
-        cusum_df = self.cusum_engine.fit_transform(residual)
-        return pd.concat([grp, cusum_df], axis=1)
-
-    # ── F4: 3-bit diagnostic state machine ──────────────────
-    def _f4_state_machine(self, df: pd.DataFrame) -> pd.DataFrame:
+    def _f4_state_machine(self, df):
         df = df.copy()
-        # Compute per-table dynamic row floor (5th percentile of historical writes)
-        row_floors = (
-            df[df["rows_written"] > 0]
-              .groupby("table_name")["rows_written"]
-              .quantile(0.05)
-              .to_dict()
-        )
-        results = []
+        floors = df[df["rows_written"] > 0].groupby("table_name")["rows_written"].quantile(0.05).to_dict()
+        out = []
         for _, row in df.iterrows():
-            floor = max(10, int(row_floors.get(row["table_name"], 10)))
+            floor = max(10, int(floors.get(row["table_name"], 10)))
             sc, label, owner, e, rr, rw = compute_diagnostic_state(row, floor, floor)
-            results.append({
-                "diag_state_code":  sc,
-                "diag_state_label": label,
-                "diag_owner":       owner,
-                "diag_exec_ok":     e,
-                "diag_read_ok":     rr,
-                "diag_write_ok":    rw,
-                "row_write_ratio":  (row["rows_written"] /
-                                     max(1, row["rows_read"])),
-            })
-        return pd.concat([df, pd.DataFrame(results, index=df.index)], axis=1)
+            out.append({"diag_state_code": sc, "diag_state_label": label, "diag_owner": owner,
+                        "diag_exec_ok": e, "diag_read_ok": rr, "diag_write_ok": rw,
+                        "row_write_ratio": row["rows_written"] / max(1, row["rows_read"]),
+                        "was_retried": int(row["execution_status"] == "RETRIED")})
+        return pd.concat([df, pd.DataFrame(out, index=df.index)], axis=1)
 
-    # ── F5: DAG graph features ───────────────────────────────
-    def _f5_dag(self, df: pd.DataFrame) -> pd.DataFrame:
-        dag_rows = [self.dag_extractor.get_features(t)
-                    for t in df["table_name"]]
-        return pd.concat([df, pd.DataFrame(dag_rows, index=df.index)], axis=1)
+    def _f5_dag(self, df):
+        rows = [self.dag_extractor.get_features(t) for t in df["table_name"]]
+        return pd.concat([df, pd.DataFrame(rows, index=df.index)], axis=1)
 
-    # ── F6: Rolling entropy + higher-order stats ─────────────
-    def _f6_rolling(self, grp: pd.DataFrame) -> pd.DataFrame:
+    def _f6_rolling(self, grp):
         grp = grp.copy()
         lat = grp["latency_minutes"]
 
-        def safe_entropy(x):
-            x = np.array(x)
+        def entropy(x):
+            x = np.asarray(x)
             x = x[x > 0]
             if len(x) < 3:
                 return 0.0
-            hist, _ = np.histogram(x, bins=min(10, len(x)//2+1), density=True)
-            hist    = hist[hist > 0]
-            return float(-np.sum(hist * np.log(hist + 1e-9)))
+            h, _ = np.histogram(x, bins=min(10, len(x) // 2 + 1), density=True)
+            h = h[h > 0]
+            return float(-np.sum(h * np.log(h + 1e-9)))
 
-        grp["roll7_mean"]     = lat.shift(1).rolling(7,  min_periods=3).mean()
-        grp["roll7_std"]      = lat.shift(1).rolling(7,  min_periods=3).std()
-        grp["roll7_iqr"]      = lat.shift(1).rolling(7,  min_periods=3).apply(
-                                    lambda x: np.percentile(x,75)-np.percentile(x,25), raw=True)
-        grp["roll7_kurtosis"] = lat.shift(1).rolling(7,  min_periods=4).apply(
-                                    lambda x: stats.kurtosis(x), raw=True)
-        grp["roll7_entropy"]  = lat.shift(1).rolling(14, min_periods=7).apply(
-                                    safe_entropy, raw=True)
-        # Velocity: day-over-day change in latency
-        grp["latency_velocity"]     = lat.diff()
+        r7 = lat.shift(1).rolling(7, min_periods=3)
+        grp["roll7_mean"], grp["roll7_std"] = r7.mean(), r7.std()
+        grp["roll7_iqr"] = r7.apply(lambda x: np.percentile(x, 75) - np.percentile(x, 25), raw=True)
+        grp["roll7_kurtosis"] = lat.shift(1).rolling(7, min_periods=4).apply(lambda x: stats.kurtosis(x), raw=True)
+        grp["roll7_entropy"] = lat.shift(1).rolling(14, min_periods=7).apply(entropy, raw=True)
+        grp["latency_velocity"] = lat.diff()
         grp["latency_acceleration"] = grp["latency_velocity"].diff()
         return grp
 
-    # ── F7: Row count anomaly signals ───────────────────────
-    def _f7_row_anomaly(self, grp: pd.DataFrame) -> pd.DataFrame:
+    def _f7_row_anomaly(self, grp):
         grp = grp.copy()
         rows = grp["rows_written"].astype(float)
-        grp["rows_roll7_mean"] = rows.shift(1).rolling(7, min_periods=3).mean()
-        grp["rows_roll7_std"]  = rows.shift(1).rolling(7, min_periods=3).std()
-        grp["rows_zscore"]     = (
-            (rows - grp["rows_roll7_mean"])
-            / (grp["rows_roll7_std"].replace(0, 1e-9))
-        )
-        grp["rows_pct_drop"]   = (
-            (grp["rows_roll7_mean"] - rows)
-            / (grp["rows_roll7_mean"].replace(0, 1e-9))
-        ).clip(lower=0)
+        r7 = rows.shift(1).rolling(7, min_periods=3)
+        grp["rows_roll7_mean"], grp["rows_roll7_std"] = r7.mean(), r7.std()
+        grp["rows_zscore"] = (rows - grp["rows_roll7_mean"]) / grp["rows_roll7_std"].replace(0, 1e-9)
+        grp["rows_pct_drop"] = ((grp["rows_roll7_mean"] - rows) / grp["rows_roll7_mean"].replace(0, 1e-9)).clip(lower=0)
         return grp
 
-    # ── ORCHESTRATOR ─────────────────────────────────────────
-    def build(self) -> pd.DataFrame:
-        print("Building feature matrix...")
-        tables  = self.df["table_name"].unique()
-        chunks  = []
+    def _f8_upstream(self, df):
+        failed = df[df["diag_state_code"].isin([4, 5, 6])].groupby("day_idx")["table_name"].agg(set).to_dict()
+        alert = df[df["ewma_alert"] == 1].groupby("day_idx")["table_name"].agg(set).to_dict()
+        anc = self.dag_extractor.ancestors
+        df = df.copy()
+        df["upstream_failed_count"] = [len(anc[t] & failed.get(d, set())) for t, d in zip(df["table_name"], df["day_idx"])]
+        df["upstream_alert_count"] = [len(anc[t] & alert.get(d, set())) for t, d in zip(df["table_name"], df["day_idx"])]
+        return df
 
-        for table in tables:
+    @staticmethod
+    def rule_baseline(full: pd.DataFrame) -> np.ndarray:
+        """v1 threshold rule, kept as a baseline detector (never a training target)."""
+        c = [
+            (full["diag_state_code"].isin([4, 5, 6])) | (full["cusum_drift_score"] > 4.0),
+            (full["cusum_drift_score"] > 2.5) | (full["latency_zscore"] > 3.0) | (full["diag_state_code"] == 1),
+            (full["cusum_drift_score"] > 1.5) | (full["latency_zscore"] > 2.0) | (full["rows_zscore"] < -2.5),
+            (full["cusum_drift_score"] > 0.5) | (full["latency_zscore"] > 1.0),
+        ]
+        sev = np.zeros(len(full), dtype=int)
+        for level, cond in enumerate(reversed(c), start=1):
+            sev = np.where(cond & (sev < level), level, sev)
+        return sev
+
+    def build(self, verbose: bool = False) -> pd.DataFrame:
+        chunks = []
+        for table in self.df["table_name"].unique():
             grp = self.df[self.df["table_name"] == table].copy()
             grp = self._f1_temporal(grp)
-            grp = self._f2_stl(grp)
-            grp = self._f3_cusum(grp)
+            grp = self._f2_f3_causal(grp)
+            if self.include_stl_audit:
+                grp = self._stl_audit(grp)
             grp = self._f6_rolling(grp)
             grp = self._f7_row_anomaly(grp)
             chunks.append(grp)
-            print(f"  ✓ {table}")
-
+            if verbose:
+                print(f"  built {table}")
         full = pd.concat(chunks).sort_values(["day_idx", "table_name"])
         full = self._f4_state_machine(full)
         full = self._f5_dag(full)
+        full = self._f8_upstream(full)
+        full = full.reset_index(drop=True)
 
-        # ── Composite severity target (for Phase 3 model) ──
-        # NOT a simple binary — 5-class ordinal severity
-        # 0=NORMAL, 1=WATCH, 2=WARN, 3=DEGRADED, 4=CRITICAL
-        conditions = [
-            (full["diag_state_code"].isin([4, 5, 6])) |
-            (full["cusum_drift_score"] > 4.0),
-            (full["cusum_drift_score"] > 2.5) |
-            (full["latency_zscore"] > 3.0) |
-            (full["diag_state_code"] == 1),
-            (full["cusum_drift_score"] > 1.5) |
-            (full["latency_zscore"] > 2.0) |
-            (full["rows_zscore"] < -2.5),
-            (full["cusum_drift_score"] > 0.5) |
-            (full["latency_zscore"] > 1.0),
-        ]
-        severity = np.zeros(len(full), dtype=int)
-        for level, cond in enumerate(reversed(conditions), start=1):
-            severity = np.where(cond & (severity < level), level, severity)
-
-        full["severity_label"] = severity
-        full["severity_name"]  = pd.Categorical(
-            full["severity_label"].map(
-                {0:"NORMAL",1:"WATCH",2:"WARN",3:"DEGRADED",4:"CRITICAL"}),
-            categories=["NORMAL","WATCH","WARN","DEGRADED","CRITICAL"],
-            ordered=True
-        )
-        print(f"\nFeature matrix: {full.shape}")
-        print(f"\nSeverity distribution:")
-        print(full["severity_name"].value_counts().sort_index().to_string())
+        names = ["NORMAL", "WATCH", "WARN", "DEGRADED", "CRITICAL"]
+        full["rule_severity"] = self.rule_baseline(full)
+        full["event_family"] = ground_truth_family(full)
+        full["severity_label"] = ground_truth_severity(full)
+        full["severity_name"] = pd.Categorical(full["severity_label"].map(dict(enumerate(names))),
+                                               categories=names, ordered=True)
         return full
 
 
 if __name__ == "__main__":
-    import sys, os
-    _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    sys.path.insert(0, _ROOT)
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     from data.simulator import PipelineEcosystemSimulator
 
-    sim = PipelineEcosystemSimulator(n_days=180, seed=42)
-    df, dag = sim.generate()
-
-    engineer = FreshnessFeatureEngineer(df, dag)
-    features = engineer.build()
-    features.to_csv(
-        os.path.join(_ROOT, "data", "feature_matrix.csv"), index=False)
-    print(f"\n✓ Saved feature matrix — {features.shape[1]} features, {len(features):,} rows")
+    raw, graph = PipelineEcosystemSimulator(n_days=180, seed=42).generate()
+    features = FreshnessFeatureEngineer(raw, graph).build(verbose=True)
+    features.to_csv(os.path.join(root, "data", "feature_matrix.csv"), index=False)
+    print(f"Saved feature matrix: {features.shape[1]} columns, {len(features):,} rows")
+    print(features["severity_name"].value_counts().sort_index().to_string())

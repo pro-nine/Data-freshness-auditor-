@@ -1,315 +1,213 @@
 """
-CascadingFreshnessClassifier
-=============================
-Two-stage architecture:
+CascadingFreshnessClassifier (v2)
+=================================
+Stage 1  binary anomaly detector: "is this run wrong?"
+Stage 2  ordinal severity ranker (Frank & Hall decomposition): "how bad?"
+Floors   detectors that need no failure examples set a minimum severity:
+         3-bit state (failed or silent) -> DEGRADED, EWMA alert -> WARN,
+         retried run with abnormal latency -> WARN. `predict(floors=False)`
+         returns the pure learned cascade.
 
-Stage 1 — Binary Anomaly Detector
-    "Is something wrong with this pipeline run?"
-    LightGBM binary classifier on all 60 features.
-    Outputs: anomaly_prob, anomaly_flag
-
-Stage 2 — Ordinal Severity Ranker
-    "How bad is it?" — only runs when Stage 1 flags anomaly.
-    Uses Frank et al. (2001) ordinal decomposition:
-    Decomposes 5-class ordinal problem into 4 binary problems.
-    P(Y > k) for k in {NORMAL, WATCH, WARN, DEGRADED}
-    Combines binary outputs to produce calibrated ordinal probabilities.
-
-Why NOT a single 5-class classifier (the common tutorial approach):
-    A flat multiclass model treats NORMAL→CRITICAL as unordered.
-    It can output "CRITICAL" for what should be "WATCH" and the loss
-    function penalises it identically to predicting "NORMAL" → complete
-    misuse of ordinal information.
-    The ordinal decomposition preserves rank information in the loss
-    function: predicting WARN when true is DEGRADED costs less than
-    predicting NORMAL when true is DEGRADED.
-
-CUSUM Hard Override Rule:
-    If cusum_alert_up == 1 AND dag_criticality >= 3:
-        severity_floor = WARN (severity index >= 2)
-    This is a domain-knowledge rule that cannot be learned from data alone
-    in a short training window. CUSUM is a sequential test with provable
-    statistical properties; letting the ML model override it on CRITICAL
-    tables would be epistemically wrong.
+Changes from v1
+* The Stage 1 threshold is chosen on the validation set. v1 chose it on the
+  training set, where the model has already seen the labels.
+* Stage 1 probabilities are calibrated on validation data with isotonic
+  regression, so `anomaly_prob` can be read as a frequency.
+* Class imbalance uses sample weights, which both backends support.
+* Stage 2 skips thresholds that have no positive examples (v1 crashed when a
+  severity level was missing from the training rows).
+* v1's CUSUM override flagged rows that were already at WARN as overridden;
+  `floor_applied` marks only rows whose severity was actually raised.
+* LightGBM is the default backend. If it is not installed the classifier falls
+  back to scikit-learn's HistGradientBoosting, and reports which one it used.
 """
+import warnings
 
 import numpy as np
 import pandas as pd
-import lightgbm as lgb
-from sklearn.calibration import CalibratedClassifierCV
-from sklearn.base import BaseEstimator, ClassifierMixin
-from sklearn.metrics import roc_auc_score
-import warnings
+from sklearn.isotonic import IsotonicRegression
+
 warnings.filterwarnings("ignore")
 
-SEVERITY_NAMES  = ["NORMAL", "WATCH", "WARN", "DEGRADED", "CRITICAL"]
-SEVERITY_INT    = {v: i for i, v in enumerate(SEVERITY_NAMES)}
-N_CLASSES       = len(SEVERITY_NAMES)
+SEVERITY_NAMES = ["NORMAL", "WATCH", "WARN", "DEGRADED", "CRITICAL"]
+N_CLASSES = len(SEVERITY_NAMES)
 
 
-# ─────────────────────────────────────────────────────────────
-# ORDINAL BINARY DECOMPOSITION
-# Frank & Hall (2001): "A Simple Approach to Ordinal Classification"
-# ─────────────────────────────────────────────────────────────
-class OrdinalDecompositionRanker(BaseEstimator, ClassifierMixin):
-    """
-    Trains K-1 binary classifiers for K ordinal classes.
-    Binary classifier k asks: P(Y > k)?
-
-    For 5 severity levels: trains 4 classifiers:
-        Clf0: P(severity > NORMAL)
-        Clf1: P(severity > WATCH)
-        Clf2: P(severity > WARN)
-        Clf3: P(severity > DEGRADED)
-
-    Final class probabilities:
-        P(NORMAL)   = 1 - P(Y>0)
-        P(WATCH)    = P(Y>0) - P(Y>1)
-        P(WARN)     = P(Y>1) - P(Y>2)
-        P(DEGRADED) = P(Y>2) - P(Y>3)
-        P(CRITICAL) = P(Y>3)
-    """
-
-    def __init__(self, lgb_params: dict = None):
-        self.lgb_params = lgb_params or {
-            "objective":        "binary",
-            "metric":           "auc",
-            "n_estimators":     400,
-            "learning_rate":    0.04,
-            "num_leaves":       47,
-            "min_child_samples": 20,
-            "feature_fraction": 0.75,
-            "bagging_fraction": 0.75,
-            "bagging_freq":     5,
-            "reg_alpha":        0.1,
-            "reg_lambda":       0.2,
-            "verbose":          -1,
-            "n_jobs":           -1,
-            "random_state":     42,
-        }
-        self.classifiers_ = []
-        self.classes_      = np.arange(N_CLASSES)
-
-    def fit(self, X: pd.DataFrame, y: pd.Series,
-            eval_set=None) -> "OrdinalDecompositionRanker":
-        y_int = y.values if hasattr(y, "values") else np.array(y)
-        self.classifiers_ = []
-
-        for k in range(N_CLASSES - 1):
-            # Binary target: 1 if severity > k, else 0
-            y_binary = (y_int > k).astype(int)
-            pos_rate  = y_binary.mean()
-
-            params = self.lgb_params.copy()
-            # Class weight to handle imbalance at each threshold
-            if 0.05 < pos_rate < 0.95:
-                params["scale_pos_weight"] = (1 - pos_rate) / (pos_rate + 1e-9)
-
-            clf = lgb.LGBMClassifier(**params)
-            clf.fit(X, y_binary,
-                    eval_set=[(eval_set[0], (eval_set[1].values > k).astype(int))]
-                              if eval_set else None,
-                    callbacks=[lgb.early_stopping(40, verbose=False),
-                                lgb.log_evaluation(period=-1)]
-                               if eval_set else None)
-            self.classifiers_.append(clf)
-            auc = roc_auc_score(y_binary,
-                                clf.predict_proba(X)[:,1])
-            print(f"    Ordinal clf {k} (P(Y>{k})={SEVERITY_NAMES[k]}): "
-                  f"AUC={auc:.4f}  pos_rate={pos_rate:.3f}")
-
-        return self
-
-    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
-        # Collect P(Y > k) for each threshold k
-        exceed_probs = np.stack(
-            [clf.predict_proba(X)[:, 1] for clf in self.classifiers_],
-            axis=1
-        )  # shape (n, K-1)
-
-        # Ensure monotonically non-increasing: P(Y>0) >= P(Y>1) >= ...
-        for k in range(1, exceed_probs.shape[1]):
-            exceed_probs[:, k] = np.minimum(exceed_probs[:, k],
-                                             exceed_probs[:, k-1])
-
-        # Convert to class probabilities
-        n = len(X)
-        class_probs = np.zeros((n, N_CLASSES))
-        class_probs[:, 0] = 1 - exceed_probs[:, 0]
-        for k in range(1, N_CLASSES - 1):
-            class_probs[:, k] = exceed_probs[:, k-1] - exceed_probs[:, k]
-        class_probs[:, -1] = exceed_probs[:, -1]
-
-        # Clip and renormalise
-        class_probs = np.clip(class_probs, 0, 1)
-        class_probs /= class_probs.sum(axis=1, keepdims=True) + 1e-9
-        return class_probs
-
-    def predict(self, X: pd.DataFrame) -> np.ndarray:
-        return self.predict_proba(X).argmax(axis=1)
-
-    def get_feature_importance(self, feature_names: list) -> pd.DataFrame:
-        """Aggregate importance across all K-1 binary classifiers."""
-        imp_dfs = []
-        for k, clf in enumerate(self.classifiers_):
-            imp_dfs.append(pd.DataFrame({
-                "feature":    feature_names,
-                "importance": clf.feature_importances_,
-                "threshold":  k,
-            }))
-        combined = pd.concat(imp_dfs)
-        return (combined.groupby("feature")["importance"]
-                        .mean()
-                        .sort_values(ascending=False)
-                        .reset_index()
-                        .rename(columns={"importance": "mean_importance"}))
+def make_booster(n_estimators=400, learning_rate=0.04, num_leaves=47, min_child_samples=20,
+                 reg_lambda=0.2, random_state=42, backend="auto"):
+    """Return (model, backend_name)."""
+    if backend in ("auto", "lightgbm"):
+        try:
+            import lightgbm as lgb
+            return lgb.LGBMClassifier(
+                objective="binary", n_estimators=n_estimators, learning_rate=learning_rate,
+                num_leaves=num_leaves, min_child_samples=min_child_samples, feature_fraction=0.75,
+                bagging_fraction=0.75, bagging_freq=5, reg_alpha=0.1, reg_lambda=reg_lambda,
+                verbose=-1, n_jobs=-1, random_state=random_state), "lightgbm"
+        except ImportError:
+            if backend == "lightgbm":
+                raise
+    from sklearn.ensemble import HistGradientBoostingClassifier
+    return HistGradientBoostingClassifier(
+        max_iter=n_estimators, learning_rate=learning_rate, max_leaf_nodes=num_leaves,
+        min_samples_leaf=min_child_samples, l2_regularization=reg_lambda,
+        random_state=random_state), "sklearn"
 
 
-# ─────────────────────────────────────────────────────────────
-# STAGE 1 — BINARY ANOMALY DETECTOR
-# ─────────────────────────────────────────────────────────────
+def fit_booster(model, kind, X, y, X_val=None, y_val=None, pos_weight=1.0):
+    w = np.where(np.asarray(y) == 1, pos_weight, 1.0)
+    if kind == "lightgbm" and X_val is not None and len(np.unique(y_val)) > 1:
+        import lightgbm as lgb
+        model.fit(X, y, sample_weight=w, eval_set=[(X_val, y_val)], eval_metric="auc",
+                  callbacks=[lgb.early_stopping(40, verbose=False), lgb.log_evaluation(period=-1)])
+    else:
+        model.fit(X, y, sample_weight=w)
+    return model
+
+
+def expected_calibration_error(y_true, prob, bins=10) -> float:
+    y_true, prob = np.asarray(y_true, float), np.asarray(prob, float)
+    edges = np.linspace(0, 1, bins + 1)
+    idx = np.clip(np.digitize(prob, edges[1:-1]), 0, bins - 1)
+    ece = 0.0
+    for b in range(bins):
+        m = idx == b
+        if m.any():
+            ece += m.mean() * abs(prob[m].mean() - y_true[m].mean())
+    return float(ece)
+
+
 class BinaryAnomalyDetector:
-
-    def __init__(self):
-        self.model = lgb.LGBMClassifier(
-            objective        = "binary",
-            metric           = "auc",
-            n_estimators     = 500,
-            learning_rate    = 0.03,
-            num_leaves       = 63,
-            min_child_samples= 25,
-            feature_fraction = 0.70,
-            bagging_fraction = 0.70,
-            bagging_freq     = 5,
-            reg_alpha        = 0.15,
-            reg_lambda       = 0.25,
-            verbose          = -1,
-            n_jobs           = -1,
-            random_state     = 42,
-        )
+    def __init__(self, backend="auto"):
+        self.backend = backend
+        self.model, self.kind = make_booster(500, 0.03, 63, 25, 0.25, backend=backend)
+        self.calibrator_ = None
         self.threshold_ = 0.5
 
-    def fit(self, X, y_binary, eval_set=None):
-        self.model.fit(
-            X, y_binary,
-            eval_set    = eval_set,
-            callbacks   = [lgb.early_stopping(50, verbose=False),
-                            lgb.log_evaluation(period=-1)]
-        )
-        # Calibrate threshold on training set using F-beta (beta=0.5)
-        # We prefer precision over recall: false alarms cost engineer attention
-        probs = self.model.predict_proba(X)[:, 1]
-        best_f, best_t = 0, 0.5
-        for t in np.arange(0.3, 0.85, 0.02):
-            preds = (probs >= t).astype(int)
-            tp = ((preds==1) & (y_binary==1)).sum()
-            fp = ((preds==1) & (y_binary==0)).sum()
-            fn = ((preds==0) & (y_binary==1)).sum()
-            prec = tp / (tp + fp + 1e-9)
-            rec  = tp / (tp + fn + 1e-9)
-            # F0.5: weights precision twice as much as recall
-            fb = (1 + 0.25) * prec * rec / (0.25 * prec + rec + 1e-9)
-            if fb > best_f:
-                best_f, best_t = fb, t
-        self.threshold_ = best_t
-        print(f"    Stage 1 threshold calibrated: {best_t:.2f}  (F0.5={best_f:.4f})")
+    def _raw(self, X):
+        return self.model.predict_proba(X)[:, 1]
+
+    def fit(self, X, y, X_val, y_val, beta=0.5):
+        pos = max(float(np.mean(y)), 1e-6)
+        fit_booster(self.model, self.kind, X, y, X_val, y_val, pos_weight=min((1 - pos) / pos, 50.0))
+        raw_val = self._raw(X_val)
+        if len(np.unique(y_val)) > 1:
+            self.calibrator_ = IsotonicRegression(out_of_bounds="clip").fit(raw_val, y_val)
+            prob = self.calibrator_.predict(raw_val)
+            best_f, best_t = -1.0, 0.5
+            for t in np.arange(0.1, 0.91, 0.02):
+                p = prob >= t
+                tp, fp, fn = (p & (y_val == 1)).sum(), (p & (y_val == 0)).sum(), (~p & (y_val == 1)).sum()
+                prec, rec = tp / (tp + fp + 1e-9), tp / (tp + fn + 1e-9)
+                f = (1 + beta ** 2) * prec * rec / (beta ** 2 * prec + rec + 1e-9)
+                if f > best_f:
+                    best_f, best_t = f, t
+            self.threshold_ = float(best_t)
         return self
 
     def predict_proba(self, X):
-        return self.model.predict_proba(X)
+        raw = self._raw(X)
+        return self.calibrator_.predict(raw) if self.calibrator_ is not None else raw
 
     def predict(self, X):
-        return (self.model.predict_proba(X)[:, 1] >= self.threshold_).astype(int)
+        return (self.predict_proba(X) >= self.threshold_).astype(int)
 
 
-# ─────────────────────────────────────────────────────────────
-# CASCADING PIPELINE — Stage 1 → Stage 2 → CUSUM Override
-# ─────────────────────────────────────────────────────────────
+class OrdinalDecompositionRanker:
+    """K-1 binary models for P(Y > k). Thresholds without positives become constants."""
+
+    def __init__(self, backend="auto"):
+        self.backend = backend
+        self.models_, self.kinds_, self.const_ = [], [], []
+
+    def fit(self, X, y, X_val=None, y_val=None):
+        y = np.asarray(y)
+        self.models_, self.kinds_, self.const_ = [], [], []
+        for k in range(N_CLASSES - 1):
+            yb = (y > k).astype(int)
+            if yb.sum() == 0 or yb.sum() == len(yb):
+                self.models_.append(None)
+                self.kinds_.append(None)
+                self.const_.append(float(yb.mean()) if len(yb) else 0.0)
+                continue
+            model, kind = make_booster(backend=self.backend)
+            yv = None if y_val is None else (np.asarray(y_val) > k).astype(int)
+            pos = yb.mean()
+            fit_booster(model, kind, X, yb, X_val, yv, pos_weight=min((1 - pos) / (pos + 1e-9), 20.0))
+            self.models_.append(model)
+            self.kinds_.append(kind)
+            self.const_.append(None)
+        return self
+
+    def predict_proba(self, X):
+        exceed = np.zeros((len(X), N_CLASSES - 1))
+        for k, m in enumerate(self.models_):
+            exceed[:, k] = self.const_[k] if m is None else m.predict_proba(X)[:, 1]
+        exceed = np.minimum.accumulate(exceed, axis=1)
+        p = np.zeros((len(X), N_CLASSES))
+        p[:, 0] = 1 - exceed[:, 0]
+        for k in range(1, N_CLASSES - 1):
+            p[:, k] = exceed[:, k - 1] - exceed[:, k]
+        p[:, -1] = exceed[:, -1]
+        p = np.clip(p, 0, 1)
+        return p / (p.sum(axis=1, keepdims=True) + 1e-9)
+
+    def feature_importance(self, names):
+        parts = [pd.DataFrame({"feature": names, "importance": m.feature_importances_})
+                 for m in self.models_ if m is not None and hasattr(m, "feature_importances_")]
+        if not parts:
+            return pd.DataFrame({"feature": names, "mean_importance": 0.0})
+        return (pd.concat(parts).groupby("feature")["importance"].mean().sort_values(ascending=False)
+                .reset_index().rename(columns={"importance": "mean_importance"}))
+
+
 class CascadingFreshnessClassifier:
+    def __init__(self, feature_cols, backend="auto"):
+        self.feature_cols = list(feature_cols)
+        self.stage1 = BinaryAnomalyDetector(backend)
+        self.stage2 = OrdinalDecompositionRanker(backend)
+        self.backend_ = self.stage1.kind
+        self.is_fitted_ = False
 
-    def __init__(self, feature_cols: list):
-        self.feature_cols    = feature_cols
-        self.stage1          = BinaryAnomalyDetector()
-        self.stage2          = OrdinalDecompositionRanker()
-        self.is_fitted_      = False
-
-    def fit(self, X_train: pd.DataFrame, y_train: pd.Series,
-             X_val: pd.DataFrame, y_val: pd.Series):
-        """
-        y_train / y_val : integer severity (0=NORMAL … 4=CRITICAL)
-        """
-        print("\n── Stage 1: Binary Anomaly Detector ──")
-        y_bin_train = (y_train > 0).astype(int)
-        y_bin_val   = (y_val   > 0).astype(int)
-        self.stage1.fit(
-            X_train[self.feature_cols], y_bin_train,
-            eval_set=[(X_val[self.feature_cols], y_bin_val)]
-        )
-        s1_auc = roc_auc_score(
-            y_bin_val,
-            self.stage1.predict_proba(X_val[self.feature_cols])[:, 1]
-        )
-        print(f"    Stage 1 Val AUC: {s1_auc:.4f}")
-
-        print("\n── Stage 2: Ordinal Severity Ranker ──")
-        # Train Stage 2 only on anomalous training rows (severity > 0)
-        # This prevents NORMAL examples from diluting the severity signal
-        anom_mask_train = y_train > 0
-        anom_mask_val   = y_val   > 0
-        print(f"    Stage 2 training rows (anomalous only): "
-              f"{anom_mask_train.sum():,} / {len(y_train):,}")
-        self.stage2.fit(
-            X_train[self.feature_cols][anom_mask_train],
-            y_train[anom_mask_train],
-            eval_set=(X_val[self.feature_cols][anom_mask_val],
-                       y_val[anom_mask_val])
-        )
+    def fit(self, X_train, y_train, X_val, y_val):
+        yt, yv = np.asarray(y_train), np.asarray(y_val)
+        self.stage1.fit(X_train[self.feature_cols], (yt > 0).astype(int),
+                        X_val[self.feature_cols], (yv > 0).astype(int))
+        m_tr, m_va = yt > 0, yv > 0
+        self.stage2.fit(X_train[self.feature_cols][m_tr], yt[m_tr],
+                        X_val[self.feature_cols][m_va], yv[m_va])
         self.is_fitted_ = True
         return self
 
-    def predict(self, X: pd.DataFrame,
-                 apply_cusum_override: bool = True) -> pd.DataFrame:
-        """
-        Returns DataFrame with:
-            anomaly_prob, anomaly_flag,
-            severity_pred (int), severity_name,
-            severity_proba (array),
-            cusum_overridden (bool)
-        """
+    @staticmethod
+    def detector_floor(X: pd.DataFrame) -> np.ndarray:
+        """Severity floors from detectors that need no failure examples to work."""
+        n = len(X)
+        floor = np.zeros(n, dtype=int)
+        state = X["diag_state_code"].values if "diag_state_code" in X else np.zeros(n)
+        floor = np.where(np.isin(state, [1, 4, 5, 6]), 3, floor)
+        if "ewma_alert" in X:
+            floor = np.maximum(floor, np.where(X["ewma_alert"].fillna(0).values > 0, 2, 0))
+        if {"was_retried", "latency_zscore"} <= set(X.columns):
+            retry = (X["was_retried"].values > 0) & (X["latency_zscore"].fillna(0).values > 3.0)
+            floor = np.maximum(floor, np.where(retry, 2, 0))
+        return floor
+
+    def predict(self, X, floors=True) -> pd.DataFrame:
+        """floors=False gives the pure learned cascade."""
         assert self.is_fitted_, "Call fit() first."
-        feats  = X[self.feature_cols]
-        n      = len(X)
-
-        # Stage 1
-        anom_proba = self.stage1.predict_proba(feats)[:, 1]
-        anom_flag  = self.stage1.predict(feats)
-
-        # Stage 2 — run on all rows, gate output by Stage 1
-        sev_proba  = self.stage2.predict_proba(feats)   # (n, 5)
-        sev_pred   = sev_proba.argmax(axis=1)
-
-        # Gate: if Stage 1 says NORMAL, force severity = NORMAL
-        sev_pred   = np.where(anom_flag == 0, 0, sev_pred)
-
-        # CUSUM hard override
-        cusum_overridden = np.zeros(n, dtype=bool)
-        if apply_cusum_override and "cusum_alert_up" in X.columns:
-            cusum_fire   = X["cusum_alert_up"].fillna(0).values.astype(bool)
-            high_crit    = X["dag_criticality"].fillna(0).values >= 3
-            override_mask= cusum_fire & high_crit
-            # Floor severity to WARN (2) for CUSUM-triggered high-criticality tables
-            sev_pred     = np.where(override_mask & (sev_pred < 2), 2, sev_pred)
-            cusum_overridden = override_mask & (sev_pred == 2)
-
+        feats = X[self.feature_cols]
+        prob = self.stage1.predict_proba(feats)
+        flag = self.stage1.predict(feats)
+        sev_p = self.stage2.predict_proba(feats)
+        sev = np.where(flag == 0, 0, np.maximum(sev_p.argmax(axis=1), 1))
+        raised = np.zeros(len(X), dtype=bool)
+        if floors:
+            fl = self.detector_floor(X)
+            raised = fl > sev
+            sev = np.maximum(sev, fl)
         return pd.DataFrame({
-            "anomaly_prob":      anom_proba,
-            "anomaly_flag":      anom_flag,
-            "severity_pred":     sev_pred,
-            "severity_name":     [SEVERITY_NAMES[s] for s in sev_pred],
-            "cusum_overridden":  cusum_overridden,
-            "p_normal":          sev_proba[:, 0],
-            "p_watch":           sev_proba[:, 1],
-            "p_warn":            sev_proba[:, 2],
-            "p_degraded":        sev_proba[:, 3],
-            "p_critical":        sev_proba[:, 4],
+            "anomaly_prob": prob, "anomaly_flag": flag, "severity_pred": sev,
+            "severity_name": [SEVERITY_NAMES[s] for s in sev], "floor_applied": raised,
+            **{f"p_{n.lower()}": sev_p[:, i] for i, n in enumerate(SEVERITY_NAMES)},
         }, index=X.index)
